@@ -43,7 +43,7 @@ function KpiCard({ label, main, mainColor, sub }) {
   )
 }
 
-function AssetCard({ label, value, prev, cost }) {
+function AssetCard({ label, value, prev, cost, sx: sxOverride }) {
   const delta = prev != null ? value - prev : null
   const deltaPct = delta != null && prev > 0 ? delta / prev * 100 : null
   const pos = delta == null || delta >= 0
@@ -51,7 +51,7 @@ function AssetCard({ label, value, prev, cost }) {
   const pnlPct = cost > 0 ? pnl / cost * 100 : null
 
   return (
-    <Card variant="outlined" sx={{ flex: 1, minWidth: 0 }}>
+    <Card variant="outlined" sx={{ flex: 1, minWidth: 0, ...sxOverride }}>
       <CardContent sx={{ pb: '16px !important' }}>
         <Typography variant="caption" color="text.secondary" display="block" noWrap>{label}</Typography>
         <Typography variant="h6" fontWeight={700} noWrap>NT${fmt(value)}</Typography>
@@ -333,17 +333,19 @@ export default function Overview() {
 
       {/* ── 資產組成明細 ─────────────────────────────────── */}
       <SectionCard title="資產組成">
-        <Stack direction="row" spacing={1} useFlexGap>
+        <Stack direction="row" spacing={1} useFlexGap sx={{ flexWrap: 'wrap' }}>
           <AssetCard
             label="銀行存款"
             value={latest.bankTotal || 0}
             prev={previous?.bankTotal}
+            sx={{ flexBasis: { xs: '100%', md: 'auto' } }}
           />
           {hasTWHoldings && (
             <AssetCard
               label="台股（即時市值）"
               value={Math.round(twStockTotal)}
               cost={twStockCost > 0 ? twStockCost : 0}
+              sx={{ flexBasis: { xs: 'calc(50% - 4px)', md: 'auto' } }}
             />
           )}
           {hasUSHoldings && (
@@ -351,6 +353,7 @@ export default function Overview() {
               label="美股"
               value={Math.round(usStockTotal)}
               cost={usStockCost > 0 ? usStockCost : 0}
+              sx={{ flexBasis: { xs: 'calc(50% - 4px)', md: 'auto' } }}
             />
           )}
         </Stack>
