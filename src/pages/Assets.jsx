@@ -13,11 +13,14 @@ import DeleteIcon from '@mui/icons-material/Delete'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import TrendingUpIcon from '@mui/icons-material/TrendingUp'
 import TrendingDownIcon from '@mui/icons-material/TrendingDown'
+import RefreshIcon from '@mui/icons-material/Refresh'
 import {
   getRecords, deleteRecord,
   getAccounts, getHoldings,
-  getExchangeRates,
+  getExchangeRates, updateHolding,
 } from '../services/firestore'
+import { hasToken, refreshHoldingFinMind } from '../services/finmind'
+import { refreshHoldingYahoo } from '../services/yahoo'
 import RecordWizard from '../components/RecordWizard'
 
 const fmt = n => Math.round(n || 0).toLocaleString()
@@ -137,7 +140,7 @@ function RecordCard({ record, previousTotal, onEdit, onDelete, expanded, onToggl
                       <TableCell sx={{ pl: 0, py: 0.5 }}>
                         <Typography variant="body2">{s.name}</Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {s.ticker} × {s.shares.toLocaleString()} 股 @ {s.currency} {s.price}
+                          {s.ticker} × {Number(s.shares).toLocaleString(undefined, { maximumFractionDigits: 4 })} 股 @ {s.currency} {s.price}
                         </Typography>
                       </TableCell>
                       <TableCell align="right" sx={{ py: 0.5 }}>
@@ -213,6 +216,8 @@ export default function Assets() {
   const [expanded, setExpanded] = useState(null)
   const [wizard, setWizard] = useState({ open: false, edit: null })
   const [deleteTarget, setDeleteTarget] = useState(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -237,6 +242,46 @@ export default function Assets() {
     load()
   }
 
+  const handleRefresh = useCallback(async () => {
+    const twHoldings = holdings.filter(h => h.market === 'TW')
+    const usHoldings = holdings.filter(h => h.market === 'US')
+    if (!twHoldings.length && !usHoldings.length) return
+
+    setRefreshing(true)
+    setRefreshMsg('')
+    let done = 0
+    const total = (hasToken() ? twHoldings.length : 0) + usHoldings.length
+
+    if (twHoldings.length && hasToken()) {
+      for (const h of twHoldings) {
+        try {
+          await refreshHoldingFinMind(user.uid, h, updateHolding, { force: true })
+          done++
+          setRefreshMsg(`更新中… ${done}/${total}`)
+        } catch (e) {
+          console.warn(`[FinMind] ${h.ticker}:`, e)
+        }
+        if (done < total) await new Promise(r => setTimeout(r, 300))
+      }
+    }
+
+    for (const h of usHoldings) {
+      try {
+        await refreshHoldingYahoo(user.uid, h, updateHolding, { force: true })
+        done++
+        setRefreshMsg(`更新中… ${done}/${total}`)
+      } catch (e) {
+        console.warn(`[Yahoo] ${h.ticker}:`, e)
+      }
+      if (done < total) await new Promise(r => setTimeout(r, 300))
+    }
+
+    setRefreshing(false)
+    setRefreshMsg(`已更新 ${done} 支持股`)
+    load()
+    setTimeout(() => setRefreshMsg(''), 4000)
+  }, [user.uid, holdings, load])
+
   if (loading) return (
     <Box sx={{ display: 'flex', justifyContent: 'center', pt: 6 }}>
       <CircularProgress />
@@ -245,21 +290,44 @@ export default function Assets() {
 
   return (
     <Box>
-      <Stack direction="row" alignItems="flex-start" sx={{ mb: 3 }}>
+      <Stack direction="row" alignItems="flex-start" sx={{ mb: 2 }}>
         <Box sx={{ flex: 1 }}>
           <Typography variant="h6" fontWeight={700}>資產紀錄</Typography>
           {records.length > 0 && (
             <Typography variant="body2" color="text.secondary">共 {records.length} 筆紀錄</Typography>
           )}
         </Box>
-        <Button
-          startIcon={<AddIcon />}
-          variant="contained"
-          onClick={() => setWizard({ open: true, edit: null })}
-        >
-          新增紀錄
-        </Button>
+        <Stack direction="row" spacing={1}>
+          {holdings.length > 0 && (
+            <Button
+              startIcon={refreshing ? <CircularProgress size={14} /> : <RefreshIcon />}
+              size="small"
+              variant="outlined"
+              onClick={handleRefresh}
+              disabled={refreshing}
+            >
+              {refreshing ? '更新中' : '同步市值'}
+            </Button>
+          )}
+          <Button
+            startIcon={<AddIcon />}
+            variant="contained"
+            onClick={() => setWizard({ open: true, edit: null })}
+          >
+            新增紀錄
+          </Button>
+        </Stack>
       </Stack>
+
+      {refreshMsg && (
+        <Alert
+          severity={refreshMsg.includes('請先') ? 'warning' : 'success'}
+          sx={{ mb: 1.5 }}
+          onClose={() => setRefreshMsg('')}
+        >
+          {refreshMsg}
+        </Alert>
+      )}
 
       {records.length === 0 ? (
         <Alert severity="info">

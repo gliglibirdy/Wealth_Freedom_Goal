@@ -10,13 +10,16 @@ import AddIcon from '@mui/icons-material/Add'
 import TrendingUpIcon from '@mui/icons-material/TrendingUp'
 import TrendingDownIcon from '@mui/icons-material/TrendingDown'
 import NoteAltIcon from '@mui/icons-material/NoteAlt'
+import RefreshIcon from '@mui/icons-material/Refresh'
 import {
   LineChart, Line, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid,
   BarChart, Bar, Cell,
   PieChart, Pie, Legend,
 } from 'recharts'
-import { getRecords, getSettings, getHoldings } from '../services/firestore'
+import { getRecords, getSettings, getHoldings, getExchangeRates, updateHolding } from '../services/firestore'
+import { calcAnnualDividend, calcThisMonthDividend, hasToken, refreshHoldingFinMind } from '../services/finmind'
+import { refreshHoldingYahoo } from '../services/yahoo'
 
 const fmt = n => Math.round(n || 0).toLocaleString()
 
@@ -40,7 +43,7 @@ function KpiCard({ label, main, mainColor, sub }) {
   )
 }
 
-function AssetRow({ label, value, prev, cost, isLast }) {
+function AssetCard({ label, value, prev, cost }) {
   const delta = prev != null ? value - prev : null
   const deltaPct = delta != null && prev > 0 ? delta / prev * 100 : null
   const pos = delta == null || delta >= 0
@@ -48,38 +51,27 @@ function AssetRow({ label, value, prev, cost, isLast }) {
   const pnlPct = cost > 0 ? pnl / cost * 100 : null
 
   return (
-    <Box sx={{ py: 1.25, borderBottom: isLast ? 'none' : '1px solid', borderColor: 'divider' }}>
-      <Stack direction="row" alignItems="flex-start">
-        <Box sx={{ flex: 1 }}>
-          <Typography variant="body2" fontWeight={500}>{label}</Typography>
-          {cost > 0 && (
-            <Typography variant="caption" color="text.secondary">
-              {'成本 NT$' + fmt(cost)}
-              {pnlPct != null && (
-                <Box
-                  component="span"
-                  sx={{ ml: 0.75, color: pnl >= 0 ? 'success.main' : 'error.main', fontWeight: 600 }}
-                >
-                  {pnl >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%
-                </Box>
-              )}
-            </Typography>
-          )}
-        </Box>
-        <Box sx={{ textAlign: 'right' }}>
-          <Typography variant="body2" fontWeight={700}>NT${fmt(value)}</Typography>
-          {delta != null && (
-            <Typography
-              variant="caption"
-              color={pos ? 'success.main' : 'error.main'}
-              display="block"
-            >
-              {pos ? '+' : ''}{fmt(delta)}（{pos ? '+' : ''}{deltaPct?.toFixed(1)}%）
-            </Typography>
-          )}
-        </Box>
-      </Stack>
-    </Box>
+    <Card variant="outlined" sx={{ flex: 1, minWidth: 0 }}>
+      <CardContent sx={{ pb: '16px !important' }}>
+        <Typography variant="caption" color="text.secondary" display="block" noWrap>{label}</Typography>
+        <Typography variant="h6" fontWeight={700} noWrap>NT${fmt(value)}</Typography>
+        {delta != null && (
+          <Typography variant="caption" color={pos ? 'success.main' : 'error.main'} display="block">
+            {pos ? '+' : ''}{fmt(delta)}（{pos ? '+' : ''}{deltaPct?.toFixed(1)}%）
+          </Typography>
+        )}
+        {cost > 0 && (
+          <Typography variant="caption" color="text.secondary" display="block">
+            {'成本 NT$' + fmt(cost)}
+            {pnlPct != null && (
+              <Box component="span" sx={{ ml: 0.5, color: pnl >= 0 ? 'success.main' : 'error.main', fontWeight: 600 }}>
+                （{pnl >= 0 ? '+' : ''}{pnlPct.toFixed(1)}%）
+              </Box>
+            )}
+          </Typography>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -126,22 +118,67 @@ export default function Overview() {
   const [records, setRecords] = useState([])
   const [settings, setSettings] = useState(null)
   const [holdings, setHoldings] = useState([])
+  const [usdNtd, setUsdNtd] = useState(32)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [r, s, h] = await Promise.all([
+    const [r, s, h, rates] = await Promise.all([
       getRecords(user.uid),
       getSettings(user.uid),
       getHoldings(user.uid),
+      getExchangeRates(user.uid),
     ])
     setRecords(r)
     setSettings(s)
     setHoldings(h)
+    setUsdNtd(rates.USD_NTD || 32)
     setLoading(false)
   }, [user.uid])
 
   useEffect(() => { load() }, [load])
+
+  const handleRefresh = useCallback(async () => {
+    const twHoldings = holdings.filter(h => h.market === 'TW')
+    const usHoldings = holdings.filter(h => h.market === 'US')
+    if (!twHoldings.length && !usHoldings.length) return
+
+    setRefreshing(true)
+    setRefreshMsg('')
+    let done = 0
+    const total = (hasToken() ? twHoldings.length : 0) + usHoldings.length
+
+    if (twHoldings.length && hasToken()) {
+      for (const h of twHoldings) {
+        try {
+          await refreshHoldingFinMind(user.uid, h, updateHolding, { force: true })
+          done++
+          setRefreshMsg(`更新中… ${done}/${total}`)
+        } catch (e) {
+          console.warn(`[FinMind] ${h.ticker}:`, e)
+        }
+        if (done < total) await new Promise(r => setTimeout(r, 300))
+      }
+    }
+
+    for (const h of usHoldings) {
+      try {
+        await refreshHoldingYahoo(user.uid, h, updateHolding, { force: true })
+        done++
+        setRefreshMsg(`更新中… ${done}/${total}`)
+      } catch (e) {
+        console.warn(`[Yahoo] ${h.ticker}:`, e)
+      }
+      if (done < total) await new Promise(r => setTimeout(r, 300))
+    }
+
+    setRefreshing(false)
+    setRefreshMsg(`已更新 ${done} 支持股`)
+    load()
+    setTimeout(() => setRefreshMsg(''), 4000)
+  }, [user.uid, holdings, load])
 
   if (loading) return (
     <Box sx={{ display: 'flex', justifyContent: 'center', pt: 6 }}>
@@ -167,23 +204,38 @@ export default function Overview() {
   const previous = records[1]
 
   // ── Calculations ─────────────────────────────────────────
-  const twStockTotal = latest.twStockTotal || 0
-  const usStockTotal = latest.usStockTotal || 0
-  const stockTotal = twStockTotal + usStockTotal
+  // Shares from latest record's snapshots; prices from holdings cache
+  const latestSnapshots = latest?.stockSnapshots || []
 
-  const delta = previous ? latest.totalAssets - previous.totalAssets : null
+  const twStockTotal = latestSnapshots
+    .filter(s => s.market === 'TW')
+    .reduce((sum, s) => {
+      const h = holdings.find(h => h.id === s.holdingId)
+      return sum + (h?.finmindPrice || s.price || 0) * (s.shares || 0)
+    }, 0)
+  const usStockTotal = latestSnapshots
+    .filter(s => s.market === 'US')
+    .reduce((sum, s) => {
+      const h = holdings.find(h => h.id === s.holdingId)
+      return sum + (h?.yahooPrice || h?.manualPrice || 0) * (s.shares || 0) * usdNtd
+    }, 0)
+  const hasTWHoldings = latestSnapshots.some(s => s.market === 'TW')
+  const hasUSHoldings = latestSnapshots.some(s => s.market === 'US')
+  const stockTotal = twStockTotal + usStockTotal
+  const liveTotalAssets = (latest.bankTotal || 0) + stockTotal
+
+  const delta = previous ? liveTotalAssets - previous.totalAssets : null
   const deltaPct = delta != null && previous.totalAssets > 0
     ? delta / previous.totalAssets * 100 : null
   const positive = delta == null || delta >= 0
 
-  // Stock costs from holdings
-  const twStockCost = holdings
-    .filter(h => h.market === 'TW')
-    .reduce((s, h) => s + (h.totalCost || (h.shares || 0) * (h.avgCost || 0)), 0)
-  const usStockCost = holdings
-    .filter(h => h.market === 'US')
-    .reduce((s, h) => s + (h.totalCost || (h.shares || 0) * (h.avgCost || 0)), 0)
-  const totalStockCost = twStockCost + usStockCost
+  // Stock costs from snapshots
+  const twStockCost = latestSnapshots
+    .filter(s => s.market === 'TW')
+    .reduce((sum, s) => sum + (s.avgCost || 0) * (s.shares || 0), 0)
+  const usStockCost = latestSnapshots
+    .filter(s => s.market === 'US')
+    .reduce((sum, s) => sum + (s.avgCost || 0) * (s.shares || 0) * usdNtd, 0)
 
   // Net cash flow & savings rate
   const netCashFlow = previous
@@ -195,7 +247,15 @@ export default function Overview() {
     : null
 
   const target = monthlyExpense * 12 * 25
-  const estimatedDiv = latest.estimatedMonthlyDividend || 0
+
+  // Dividend calculations: holdings metadata + shares from latest record
+  const holdingsWithShares = holdings.map(h => {
+    const snap = latestSnapshots.find(s => s.holdingId === h.id)
+    return { ...h, shares: snap?.shares || 0 }
+  })
+  const thisMonthDiv = Math.round(holdingsWithShares.reduce((s, h) => s + calcThisMonthDividend(h, usdNtd), 0))
+  const annualDiv = Math.round(holdingsWithShares.reduce((s, h) => s + calcAnnualDividend(h, usdNtd), 0))
+  const monthlyAvgDiv = Math.round(annualDiv / 12)
 
   // ── Chart data ───────────────────────────────────────────
   const chartData = [...records].reverse().map(r => ({
@@ -207,30 +267,53 @@ export default function Overview() {
 
   const pieData = [
     { name: '銀行存款', value: latest.bankTotal || 0, color: PIE_COLORS.bank },
-    { name: '台股', value: twStockTotal, color: PIE_COLORS.tw },
-    { name: '美股', value: usStockTotal, color: PIE_COLORS.us },
+    { name: '台股', value: Math.round(twStockTotal), color: PIE_COLORS.tw },
+    { name: '美股', value: Math.round(usStockTotal), color: PIE_COLORS.us },
   ].filter(d => d.value > 0)
 
   const hasPassiveData = chartData.some(d => d.passive > 0)
 
   return (
     <Box>
-      <Stack direction="row" alignItems="flex-start" sx={{ mb: 2 }}>
+      <Stack direction="row" alignItems="flex-start" sx={{ mb: 1 }}>
         <Box sx={{ flex: 1 }}>
           <Typography variant="h6" fontWeight={700}>總覽</Typography>
           <Typography variant="caption" color="text.secondary">最新紀錄：{latest.month}</Typography>
         </Box>
-        <Button startIcon={<AddIcon />} variant="outlined" size="small" onClick={() => navigate('/assets')}>
-          新增紀錄
-        </Button>
+        <Stack direction="row" spacing={1}>
+          {holdings.length > 0 && (
+            <Button
+              startIcon={refreshing ? <CircularProgress size={14} /> : <RefreshIcon />}
+              size="small"
+              variant="outlined"
+              onClick={handleRefresh}
+              disabled={refreshing}
+            >
+              {refreshing ? '更新中' : '同步市值'}
+            </Button>
+          )}
+          <Button startIcon={<AddIcon />} variant="outlined" size="small" onClick={() => navigate('/assets')}>
+            新增紀錄
+          </Button>
+        </Stack>
       </Stack>
+
+      {refreshMsg && (
+        <Alert
+          severity={refreshMsg.includes('請先') ? 'warning' : 'success'}
+          sx={{ mb: 1.5 }}
+          onClose={() => setRefreshMsg('')}
+        >
+          {refreshMsg}
+        </Alert>
+      )}
 
       {/* ── Hero ─────────────────────────────────────────── */}
       <Card sx={{ mb: 2, bgcolor: 'success.light', color: 'success.dark' }}>
         <CardContent>
-          <Typography variant="body2" sx={{ opacity: 0.65 }}>本月總資產</Typography>
+          <Typography variant="body2" sx={{ opacity: 0.65 }}>本月總資產（即時）</Typography>
           <Typography variant="h4" fontWeight={800} sx={{ my: 0.5 }}>
-            NT${fmt(latest.totalAssets)}
+            NT${fmt(liveTotalAssets)}
           </Typography>
           {delta != null && (
             <Chip
@@ -248,13 +331,38 @@ export default function Overview() {
         </CardContent>
       </Card>
 
+      {/* ── 資產組成明細 ─────────────────────────────────── */}
+      <SectionCard title="資產組成">
+        <Stack direction="row" spacing={1} useFlexGap>
+          <AssetCard
+            label="銀行存款"
+            value={latest.bankTotal || 0}
+            prev={previous?.bankTotal}
+          />
+          {hasTWHoldings && (
+            <AssetCard
+              label="台股（即時市值）"
+              value={Math.round(twStockTotal)}
+              cost={twStockCost > 0 ? twStockCost : 0}
+            />
+          )}
+          {hasUSHoldings && (
+            <AssetCard
+              label="美股"
+              value={Math.round(usStockTotal)}
+              cost={usStockCost > 0 ? usStockCost : 0}
+            />
+          )}
+        </Stack>
+      </SectionCard>
+
       {/* ── 兩個關鍵指標 ─────────────────────────────────── */}
       <Stack direction="row" spacing={1.5} sx={{ mb: 2 }} useFlexGap>
         <KpiCard
-          label="本月被動收入"
-          main={`NT$${fmt(latest.passiveIncome || 0)}`}
-          mainColor="success.main"
-          sub={estimatedDiv > 0 ? `預估股息 NT$${fmt(estimatedDiv)}/月` : undefined}
+          label="本月預期配息"
+          main={`NT$${fmt(thisMonthDiv)}`}
+          mainColor={thisMonthDiv > 0 ? 'success.main' : 'text.secondary'}
+          sub={annualDiv > 0 ? `年預期 NT$${fmt(annualDiv)}` : '尚無配息資料'}
         />
         <KpiCard
           label="本月儲蓄率"
@@ -271,40 +379,6 @@ export default function Overview() {
           }
         />
       </Stack>
-
-      {/* ── 資產組成明細 ─────────────────────────────────── */}
-      <SectionCard title="資產組成">
-        <AssetRow
-          label="銀行存款"
-          value={latest.bankTotal || 0}
-          prev={previous?.bankTotal}
-        />
-        {(twStockTotal > 0 || (previous?.twStockTotal || 0) > 0) && (
-          <AssetRow
-            label="台股"
-            value={twStockTotal}
-            prev={previous?.twStockTotal}
-            cost={twStockCost > 0 ? twStockCost : 0}
-          />
-        )}
-        {(usStockTotal > 0 || (previous?.usStockTotal || 0) > 0) && (
-          <AssetRow
-            label="美股"
-            value={usStockTotal}
-            prev={previous?.usStockTotal}
-            cost={usStockCost > 0 ? usStockCost : 0}
-            isLast
-          />
-        )}
-        {totalStockCost === 0 && (
-          <AssetRow
-            label="股票"
-            value={stockTotal}
-            prev={previous ? (previous.twStockTotal || 0) + (previous.usStockTotal || 0) : undefined}
-            isLast
-          />
-        )}
-      </SectionCard>
 
       {/* ── Charts ───────────────────────────────────────── */}
       {records.length >= 2 && (
@@ -347,8 +421,8 @@ export default function Overview() {
                   <Tooltip formatter={(v, name) => [`NT$${fmt(v)}`, name]} />
                   <Legend
                     formatter={(value, entry) => {
-                      const pct = latest.totalAssets > 0
-                        ? (entry.payload.value / latest.totalAssets * 100).toFixed(1)
+                      const pct = liveTotalAssets > 0
+                        ? (entry.payload.value / liveTotalAssets * 100).toFixed(1)
                         : 0
                       return `${value} ${pct}%`
                     }}
@@ -399,11 +473,11 @@ export default function Overview() {
               <Typography variant="caption" color="text.secondary">財務自由目標</Typography>
               <Typography variant="body2" fontWeight={600}>NT${fmt(target)}</Typography>
             </Box>
-            {estimatedDiv > 0 && (
+            {monthlyAvgDiv > 0 && (
               <Box>
-                <Typography variant="caption" color="text.secondary">預估月股息</Typography>
+                <Typography variant="caption" color="text.secondary">月均預期配息</Typography>
                 <Typography variant="body2" fontWeight={600} color="success.main">
-                  NT${fmt(estimatedDiv)}
+                  NT${fmt(monthlyAvgDiv)}
                 </Typography>
               </Box>
             )}

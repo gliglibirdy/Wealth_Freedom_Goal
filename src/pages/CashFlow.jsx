@@ -12,7 +12,8 @@ import {
   BarChart, Bar, Cell, LineChart, Line,
   XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer,
 } from 'recharts'
-import { getRecords, getHoldings } from '../services/firestore'
+import { getRecords, getHoldings, getExchangeRates } from '../services/firestore'
+import { calcAnnualDividend, calcThisMonthDividend } from '../services/finmind'
 
 const fmt = n => Math.round(n || 0).toLocaleString()
 
@@ -46,13 +47,19 @@ export default function CashFlow() {
   const navigate = useNavigate()
   const [records, setRecords] = useState([])
   const [holdings, setHoldings] = useState([])
+  const [usdNtd, setUsdNtd] = useState(32)
   const [loading, setLoading] = useState(true)
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [r, h] = await Promise.all([getRecords(user.uid), getHoldings(user.uid)])
+    const [r, h, rates] = await Promise.all([
+      getRecords(user.uid),
+      getHoldings(user.uid),
+      getExchangeRates(user.uid),
+    ])
     setRecords(r)
     setHoldings(h)
+    setUsdNtd(rates.USD_NTD || 32)
     setLoading(false)
   }, [user.uid])
 
@@ -85,23 +92,21 @@ export default function CashFlow() {
   const netCashFlow = bankDelta != null ? bankDelta + passiveIncome : null
   const netPos = netCashFlow == null || netCashFlow >= 0
 
-  // 近 3 個月平均被動收入
-  const recent3 = records.slice(0, 3)
-  const avg3 = Math.round(recent3.reduce((s, r) => s + (r.passiveIncome || 0), 0) / recent3.length)
-
   // 年度累計被動收入
   const thisYear = new Date().getFullYear().toString()
   const ytdPassive = records
     .filter(r => r.month.startsWith(thisYear))
     .reduce((s, r) => s + (r.passiveIncome || 0), 0)
 
-  // 預估月股息
-  const estimatedDiv = latest.estimatedMonthlyDividend || (() => {
-    return Math.round(holdings.reduce((sum, h) => {
-      if (h.dividendPerShare > 0) return sum + h.dividendPerShare * h.shares * (h.dividendFrequency || 2) / 12
-      return sum
-    }, 0))
-  })()
+  // Dividend calculations: holdings metadata + shares from latest record's snapshots
+  const latestSnapshots = records[0]?.stockSnapshots || []
+  const holdingsWithShares = holdings.map(h => {
+    const snap = latestSnapshots.find(s => s.holdingId === h.id)
+    return { ...h, shares: snap?.shares || 0 }
+  })
+  const annualDivTotal = Math.round(holdingsWithShares.reduce((s, h) => s + calcAnnualDividend(h, usdNtd), 0))
+  const monthlyAvgDiv = Math.round(annualDivTotal / 12)
+  const thisMonthDiv = Math.round(holdingsWithShares.reduce((s, h) => s + calcThisMonthDividend(h, usdNtd), 0))
 
   // ── Chart data（oldest → newest）────────────────────────
   const chartData = [...records].reverse().map((r, i, arr) => {
@@ -166,17 +171,22 @@ export default function CashFlow() {
       {/* ── 被動收入概況 ──────────────────────────────── */}
       <Typography variant="body2" fontWeight={600} sx={{ mb: 1 }}>被動收入概況</Typography>
       <Stack direction="row" spacing={1.5} sx={{ mb: 2 }} flexWrap="wrap" useFlexGap>
-        <KpiCard label="本月實際收到" value={passiveIncome} color="success.main" />
-        <KpiCard label="近 3 個月平均" value={avg3} />
+        <KpiCard
+          label="月均預期配息"
+          value={monthlyAvgDiv}
+          color="primary.main"
+          sub={`年預期 NT$${Math.round(annualDivTotal).toLocaleString()}`}
+        />
+        <KpiCard
+          label="本月預期配息"
+          value={thisMonthDiv}
+          color={thisMonthDiv > 0 ? 'success.main' : 'text.secondary'}
+          sub="依配息月份計算"
+        />
       </Stack>
       <Stack direction="row" spacing={1.5} sx={{ mb: 2 }} flexWrap="wrap" useFlexGap>
-        <KpiCard
-          label="預估股息 / 月"
-          value={estimatedDiv}
-          color="primary.main"
-          sub="依持股自動計算"
-        />
         <KpiCard label={`${thisYear} 年度累計`} value={ytdPassive} />
+        <Box sx={{ flex: 1 }} />
       </Stack>
 
       {records.length < 2 && (

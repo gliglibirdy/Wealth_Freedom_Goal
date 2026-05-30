@@ -15,14 +15,17 @@ import DeleteIcon from '@mui/icons-material/Delete'
 import LogoutIcon from '@mui/icons-material/Logout'
 import CameraAltIcon from '@mui/icons-material/CameraAlt'
 import EditNoteIcon from '@mui/icons-material/EditNote'
-import TrendingUpIcon from '@mui/icons-material/TrendingUp'
-import TrendingDownIcon from '@mui/icons-material/TrendingDown'
+import RefreshIcon from '@mui/icons-material/Refresh'
 import {
   getAccounts, addAccount, updateAccount, deleteAccount,
   getHoldings, addHolding, updateHolding, deleteHolding,
   getExchangeRates, updateExchangeRates,
-  getSettings, updateSettings,
+  getSettings, updateSettings, saveRecord,
 } from '../services/firestore'
+import {
+  hasToken, formatPriceUpdated, refreshHoldingFinMind,
+} from '../services/finmind'
+import { refreshHoldingYahoo } from '../services/yahoo'
 
 const fmt = n => Math.round(n || 0).toLocaleString()
 
@@ -96,12 +99,13 @@ function AccountDialog({ open, initial, onClose, onSave }) {
 
 // ── Holding Dialog ───────────────────────────────────────────
 function HoldingDialog({ open, initial, onClose, onSave }) {
-  const { register, handleSubmit, reset, control, setValue, formState: { errors } } = useForm()
+  const { register, handleSubmit, reset, control, watch, setValue, formState: { errors } } = useForm()
   const [mode, setMode] = useState('manual')
   const [recognizing, setRecognizing] = useState(false)
   const [ocrError, setOcrError] = useState('')
   const fileInputRef = useRef(null)
   const hasApiKey = !!import.meta.env.VITE_ANTHROPIC_API_KEY
+  const market = watch('market', 'TW')
 
   useEffect(() => {
     if (!open) return
@@ -112,16 +116,13 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
       name: initial.name || '',
       ticker: initial.ticker || '',
       market: initial.market || 'TW',
-      shares: initial.shares ?? '',
-      avgCost: initial.avgCost ?? '',
-      currentPrice: initial.currentPrice ?? '',
-      totalDividendReceived: initial.totalDividendReceived ?? '',
-      dividendPerShare: initial.dividendPerShare ?? '',
-      dividendFrequency: initial.dividendFrequency ?? 2,
+      // US-only fields
+      manualPrice: initial.manualPrice ?? initial.currentPrice ?? '',
+      annualYieldPct: initial.annualYieldPct ?? '',
+      dividendFrequency: initial.dividendFrequency ?? 4,
     } : {
       name: '', ticker: '', market: 'TW',
-      shares: '', avgCost: '', currentPrice: '',
-      totalDividendReceived: '', dividendPerShare: '', dividendFrequency: 2,
+      manualPrice: '', annualYieldPct: '', dividendFrequency: 4,
     })
   }, [open, initial, reset])
 
@@ -160,7 +161,7 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
               },
               {
                 type: 'text',
-                text: '這是台灣券商 App 的庫存明細截圖。請提取以下欄位，以純 JSON 格式回傳（僅回傳 JSON，不要其他說明文字）：\n{"ticker":"股票代號","name":"股票名稱","shares":股數數字,"avgCost":成交均價數字,"currentPrice":市價數字,"totalDividendReceived":總配息金額數字}',
+                text: '這是台灣券商 App 的庫存明細截圖。請提取以下欄位，以純 JSON 格式回傳（僅回傳 JSON，不要其他說明文字）：\n{"ticker":"股票代號","name":"股票名稱"}',
               },
             ],
           }],
@@ -168,23 +169,15 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
       })
 
       const data = await resp.json()
-
-      if (!resp.ok) {
-        const msg = data?.error?.message || `HTTP ${resp.status}`
-        throw new Error(msg)
-      }
+      if (!resp.ok) throw new Error(data?.error?.message || `HTTP ${resp.status}`)
 
       const text = data.content?.[0]?.text || ''
       const match = text.match(/\{[\s\S]*\}/)
-      if (!match) throw new Error(`模型未回傳 JSON，原始回應：${text.slice(0, 100)}`)
+      if (!match) throw new Error(`模型未回傳 JSON：${text.slice(0, 100)}`)
       const parsed = JSON.parse(match[0])
 
       if (parsed.ticker) setValue('ticker', parsed.ticker)
       if (parsed.name) setValue('name', parsed.name)
-      if (parsed.shares) setValue('shares', parsed.shares)
-      if (parsed.avgCost) setValue('avgCost', parsed.avgCost)
-      if (parsed.currentPrice) setValue('currentPrice', parsed.currentPrice)
-      if (parsed.totalDividendReceived != null) setValue('totalDividendReceived', parsed.totalDividendReceived)
 
     } catch (err) {
       console.error('[OCR]', err)
@@ -224,13 +217,7 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
                   需要在 <code>.env</code> 設定 <code>VITE_ANTHROPIC_API_KEY</code> 才能使用截圖辨識。
                 </Alert>
               )}
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                hidden
-                onChange={handleImageUpload}
-              />
+              <input ref={fileInputRef} type="file" accept="image/*" hidden onChange={handleImageUpload} />
               <Button
                 variant="outlined"
                 startIcon={recognizing ? <CircularProgress size={16} /> : <CameraAltIcon />}
@@ -244,7 +231,7 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
               {ocrError && <Alert severity="error" sx={{ mt: 1 }}>{ocrError}</Alert>}
               {!recognizing && !ocrError && (
                 <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
-                  辨識後自動填入下方欄位，可手動調整後儲存。
+                  辨識代碼與股數後自動填入，可手動調整後儲存。
                 </Typography>
               )}
             </Box>
@@ -256,11 +243,24 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
             </Typography>
           </Divider>
 
+          {/* Market selector */}
+          <Controller
+            name="market"
+            control={control}
+            defaultValue="TW"
+            render={({ field }) => (
+              <TextField select label="市場" fullWidth {...field}>
+                <MenuItem value="TW">台股（股價與配息自動取得）</MenuItem>
+                <MenuItem value="US">美股（股價由 Yahoo Finance 自動取得）</MenuItem>
+              </TextField>
+            )}
+          />
+
           {/* Ticker + Name */}
           <Stack direction="row" spacing={1.5}>
             <TextField
               label="代號"
-              placeholder="0050"
+              placeholder={market === 'TW' ? '0050' : 'VT'}
               sx={{ width: 110 }}
               error={!!errors.ticker}
               helperText={errors.ticker ? '必填' : ''}
@@ -269,7 +269,7 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
             />
             <TextField
               label="股票名稱"
-              placeholder="元大台灣50"
+              placeholder={market === 'TW' ? '元大台灣50' : 'Vanguard Total World'}
               fullWidth
               error={!!errors.name}
               helperText={errors.name ? '必填' : ''}
@@ -278,84 +278,50 @@ function HoldingDialog({ open, initial, onClose, onSave }) {
             />
           </Stack>
 
-          {/* Market + DividendFrequency */}
-          <Stack direction="row" spacing={1.5}>
-            <Controller
-              name="market"
-              control={control}
-              defaultValue="TW"
-              render={({ field }) => (
-                <TextField select label="市場" sx={{ flex: 1 }} {...field}>
-                  <MenuItem value="TW">台股</MenuItem>
-                  <MenuItem value="US">美股</MenuItem>
-                </TextField>
-              )}
-            />
-            <Controller
-              name="dividendFrequency"
-              control={control}
-              defaultValue={2}
-              render={({ field }) => (
-                <TextField select label="配息頻率" sx={{ flex: 1 }} {...field}>
-                  <MenuItem value={1}>年配（1次）</MenuItem>
-                  <MenuItem value={2}>半年配（2次）</MenuItem>
-                  <MenuItem value={4}>季配（4次）</MenuItem>
-                </TextField>
-              )}
-            />
-          </Stack>
+          {/* TW info banner */}
+          {market === 'TW' && (
+            <Alert severity="info" icon={false} sx={{ py: 0.5 }}>
+              台股股價與配息資料由 FinMind API 自動取得，儲存後系統會自動抓取。
+            </Alert>
+          )}
 
-          {/* Shares + AvgCost */}
-          <Stack direction="row" spacing={1.5}>
-            <TextField
-              label="總股數"
-              type="number"
-              slotProps={{ htmlInput: { step: 1, min: 1 } }}
-              sx={{ flex: 1 }}
-              error={!!errors.shares}
-              helperText={errors.shares ? '必填' : ''}
-              {...register('shares', { required: true, min: 1 })}
-            />
-            <TextField
-              label="成交均價"
-              type="number"
-              slotProps={{ inputLabel: { shrink: true }, htmlInput: { step: '0.01', min: 0 } }}
-              sx={{ flex: 1 }}
-              placeholder="如：78.07"
-              {...register('avgCost', { min: 0 })}
-            />
-          </Stack>
-
-          {/* CurrentPrice + TotalDividendReceived */}
-          <Stack direction="row" spacing={1.5}>
-            <TextField
-              label="目前市價"
-              type="number"
-              slotProps={{ inputLabel: { shrink: true }, htmlInput: { step: '0.01', min: 0 } }}
-              sx={{ flex: 1 }}
-              placeholder="如：105.4"
-              {...register('currentPrice', { min: 0 })}
-            />
-            <TextField
-              label="累積已領配息（元）"
-              type="number"
-              slotProps={{ inputLabel: { shrink: true }, htmlInput: { step: '1', min: 0 } }}
-              sx={{ flex: 1 }}
-              placeholder="如：71"
-              {...register('totalDividendReceived', { min: 0 })}
-            />
-          </Stack>
-
-          {/* DividendPerShare */}
-          <TextField
-            label="每股配息（元）"
-            type="number"
-            slotProps={{ inputLabel: { shrink: true }, htmlInput: { step: '0.01', min: 0 } }}
-            fullWidth
-            placeholder="如：3.50"
-            helperText="查除息公告後手動填入，用於計算預期被動收入"
-            {...register('dividendPerShare', { min: 0 })}
-          />
+          {/* US-only fields */}
+          {market === 'US' && (
+            <>
+              <Stack direction="row" spacing={1.5}>
+                <TextField
+                  label="手動股價（USD，可選）"
+                  type="number"
+                  slotProps={{ inputLabel: { shrink: true }, htmlInput: { step: '0.01', min: 0 } }}
+                  sx={{ flex: 1 }}
+                  placeholder="如：105.4"
+                  helperText="留空則由 Yahoo Finance 自動取得"
+                  {...register('manualPrice', { min: 0 })}
+                />
+                <TextField
+                  label="年殖利率（%）"
+                  type="number"
+                  slotProps={{ inputLabel: { shrink: true }, htmlInput: { step: '0.01', min: 0 } }}
+                  sx={{ flex: 1 }}
+                  placeholder="如：3.5"
+                  helperText="用於估算被動收入"
+                  {...register('annualYieldPct', { min: 0 })}
+                />
+              </Stack>
+              <Controller
+                name="dividendFrequency"
+                control={control}
+                defaultValue={4}
+                render={({ field }) => (
+                  <TextField select label="配息頻率" fullWidth {...field}>
+                    <MenuItem value={1}>年配（1次）</MenuItem>
+                    <MenuItem value={2}>半年配（2次）</MenuItem>
+                    <MenuItem value={4}>季配（4次）</MenuItem>
+                  </TextField>
+                )}
+              />
+            </>
+          )}
 
         </DialogContent>
         <DialogActions>
@@ -487,8 +453,12 @@ function AccountsTab({ userId }) {
 function HoldingsTab({ userId }) {
   const [holdings, setHoldings] = useState([])
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState('')
   const [dialog, setDialog] = useState({ open: false, item: null })
   const [deleteTarget, setDeleteTarget] = useState(null)
+  const [migrating, setMigrating] = useState(false)
+  const [migrateMsg, setMigrateMsg] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -498,32 +468,141 @@ function HoldingsTab({ userId }) {
 
   useEffect(() => { load() }, [load])
 
+  const handleRefresh = async () => {
+    const twHoldings = holdings.filter(h => h.market === 'TW')
+    const usHoldings = holdings.filter(h => h.market === 'US')
+    if (!twHoldings.length && !usHoldings.length) return
+
+    setRefreshing(true)
+    setRefreshMsg('')
+    let done = 0
+    const total = (hasToken() ? twHoldings.length : 0) + usHoldings.length
+
+    if (twHoldings.length) {
+      if (!hasToken()) {
+        setRefreshMsg('VITE_FINMIND_TOKEN 未設定，跳過台股')
+      } else {
+        for (const h of twHoldings) {
+          try {
+            await refreshHoldingFinMind(userId, h, updateHolding, { force: true })
+            done++
+            setRefreshMsg(`更新中… ${done}/${total}`)
+          } catch (e) {
+            console.warn(`[FinMind] ${h.ticker}:`, e)
+          }
+          if (done < total) await new Promise(r => setTimeout(r, 300))
+        }
+      }
+    }
+
+    for (const h of usHoldings) {
+      try {
+        await refreshHoldingYahoo(userId, h, updateHolding, { force: true })
+        done++
+        setRefreshMsg(`更新中… ${done}/${total}`)
+      } catch (e) {
+        console.warn(`[Yahoo] ${h.ticker}:`, e)
+        setRefreshMsg(`${h.ticker} 更新失敗：${e.message}`)
+      }
+      if (done < total) await new Promise(r => setTimeout(r, 300))
+    }
+
+    setRefreshing(false)
+    setRefreshMsg(`已更新 ${done} 支持股`)
+    load()
+    setTimeout(() => setRefreshMsg(''), 4000)
+  }
+
   const handleSave = async (data) => {
-    const shares = Number(data.shares)
-    const avgCost = Number(data.avgCost) || 0
-    const currentPrice = Number(data.currentPrice) || 0
-    const payload = {
+    const isTW = data.market === 'TW'
+
+    const base = {
       name: data.name,
       ticker: data.ticker,
       market: data.market,
-      shares,
-      avgCost,
-      currentPrice,
-      totalCost: Math.round(shares * avgCost),
-      currentValue: Math.round(shares * currentPrice),
-      totalDividendReceived: Number(data.totalDividendReceived) || 0,
-      dividendPerShare: Number(data.dividendPerShare) || 0,
-      dividendFrequency: Number(data.dividendFrequency) || 2,
-      currency: data.market === 'US' ? 'USD' : 'TWD',
-      updatedAt: new Date().toISOString().split('T')[0],
+      currency: isTW ? 'TWD' : 'USD',
+      updatedAt: new Date().toISOString().slice(0, 10),
     }
-    if (dialog.item) {
-      await updateHolding(userId, dialog.item.id, payload)
+
+    const existing = dialog.item
+    const payload = isTW ? {
+      ...base,
+      finmindPrice: existing?.finmindPrice || 0,
+      finmindPriceUpdatedAt: existing?.finmindPriceUpdatedAt || null,
+      finmindDividends: existing?.finmindDividends || [],
+      finmindAvgDividendPerShare: existing?.finmindAvgDividendPerShare || 0,
+      finmindDividendFrequency: existing?.finmindDividendFrequency || 2,
+      finmindDividendMonths: existing?.finmindDividendMonths || [],
+      finmindDividendUpdatedAt: existing?.finmindDividendUpdatedAt || null,
+    } : {
+      ...base,
+      manualPrice: Number(data.manualPrice) || 0,
+      annualYieldPct: Number(data.annualYieldPct) || 0,
+      dividendFrequency: Number(data.dividendFrequency) || 4,
+      dividendMonths: [3, 6, 9, 12],
+      yahooPrice: existing?.yahooPrice || 0,
+      yahooPriceUpdatedAt: existing?.yahooPriceUpdatedAt || null,
+    }
+
+    let savedId
+    if (existing) {
+      await updateHolding(userId, existing.id, payload)
+      savedId = existing.id
     } else {
-      await addHolding(userId, payload)
+      const ref = await addHolding(userId, payload)
+      savedId = ref.id
     }
     setDialog({ open: false, item: null })
+
+    if (isTW && hasToken()) {
+      refreshHoldingFinMind(userId, { ...payload, id: savedId }, updateHolding)
+        .then(load)
+        .catch(e => console.warn('[FinMind] Auto-fetch failed:', e))
+    } else if (!isTW) {
+      refreshHoldingYahoo(userId, { ...payload, id: savedId }, updateHolding)
+        .then(load)
+        .catch(e => console.warn('[Yahoo] Auto-fetch failed:', e))
+    }
+
     load()
+  }
+
+  const handleMigrate = async () => {
+    setMigrating(true)
+    setMigrateMsg('')
+    try {
+      const rates = await getExchangeRates(userId)
+      const usdNtd = rates.USD_NTD || 32
+      const stockSnapshots = holdings.map(h => {
+        const price = h.market === 'TW'
+          ? (h.finmindPrice || h.currentPrice || 0)
+          : (h.manualPrice || h.currentPrice || 0)
+        const shares = h.shares || 0
+        const avgCost = h.avgCost || 0
+        const marketValueNTD = Math.round(shares * price * (h.market === 'US' ? usdNtd : 1))
+        return {
+          holdingId: h.id,
+          name: h.name,
+          ticker: h.ticker,
+          market: h.market,
+          shares,
+          avgCost,
+          price,
+          priceSource: h.market === 'TW' && h.finmindPrice ? 'auto' : 'manual',
+          currency: h.market === 'US' ? 'USD' : 'NTD',
+          marketValueNTD,
+        }
+      })
+      const twStockTotal = stockSnapshots.filter(s => s.market === 'TW').reduce((s, x) => s + x.marketValueNTD, 0)
+      const usStockTotal = stockSnapshots.filter(s => s.market === 'US').reduce((s, x) => s + x.marketValueNTD, 0)
+      await saveRecord(userId, '2026-05', { stockSnapshots, twStockTotal, usStockTotal })
+      setMigrateMsg(`已將 ${stockSnapshots.length} 支持股遷移至 2026-05 紀錄`)
+    } catch (e) {
+      console.error('[migrate]', e)
+      setMigrateMsg('遷移失敗：' + e.message)
+    } finally {
+      setMigrating(false)
+    }
   }
 
   const handleDelete = async () => {
@@ -540,10 +619,19 @@ function HoldingsTab({ userId }) {
 
   return (
     <Box>
-      <Stack direction="row" alignItems="center" sx={{ mb: 2 }}>
+      <Stack direction="row" alignItems="center" sx={{ mb: 2 }} flexWrap="wrap" useFlexGap gap={1}>
         <Typography variant="subtitle1" fontWeight={600} sx={{ flex: 1 }}>
           {holdings.length > 0 ? `共 ${holdings.length} 支持股` : '持股列表'}
         </Typography>
+        <Button
+          startIcon={refreshing ? <CircularProgress size={14} /> : <RefreshIcon />}
+          size="small"
+          variant="outlined"
+          onClick={handleRefresh}
+          disabled={refreshing}
+        >
+          {refreshing ? '更新中' : '重新整理'}
+        </Button>
         <Button
           startIcon={<AddIcon />}
           variant="contained"
@@ -554,17 +642,32 @@ function HoldingsTab({ userId }) {
         </Button>
       </Stack>
 
+      {refreshMsg && (
+        <Alert severity={refreshMsg.includes('請先') ? 'warning' : 'success'} sx={{ mb: 1.5 }}>
+          {refreshMsg}
+        </Alert>
+      )}
+
+      {!hasToken() && holdings.some(h => h.market === 'TW') && (
+        <Alert severity="warning" sx={{ mb: 1.5 }}>
+          尚未設定 VITE_FINMIND_TOKEN，台股股價與配息將無法自動取得。
+        </Alert>
+      )}
+
       {holdings.length === 0 ? (
         <Alert severity="info">尚未新增任何持股，請點選「新增持股」開始設定。</Alert>
       ) : (
         <List disablePadding>
           {holdings.map((h, i) => {
-            const totalCost = h.totalCost ?? (h.shares * (h.avgCost || 0))
-            const currentValue = h.currentValue ?? (h.shares * (h.currentPrice || 0))
-            const pnl = currentValue - totalCost
-            const pnlPct = totalCost > 0 ? (pnl / totalCost * 100) : null
-            const annualDiv = (h.dividendPerShare || 0) * h.shares * (h.dividendFrequency || 2)
-            const positive = pnl >= 0
+            const currentPx = h.market === 'TW'
+              ? (h.finmindPrice || 0)
+              : (h.yahooPrice || h.manualPrice || 0)
+            const priceUpdated = h.market === 'TW'
+              ? formatPriceUpdated(h.finmindPriceUpdatedAt)
+              : formatPriceUpdated(h.yahooPriceUpdatedAt)
+            const divPerShare = h.market === 'TW'
+              ? (h.finmindAvgDividendPerShare || 0) * (h.finmindDividendFrequency || 2)
+              : 0
 
             return (
               <Box key={h.id}>
@@ -580,39 +683,32 @@ function HoldingsTab({ userId }) {
                           size="small"
                           color={h.market === 'TW' ? 'success' : 'secondary'}
                         />
-                        {h.updatedAt && (
-                          <Typography variant="caption" color="text.secondary">
-                            更新 {h.updatedAt}
-                          </Typography>
-                        )}
                       </Stack>
                     }
                     secondary={
                       <Stack spacing={0.25} sx={{ mt: 0.5 }}>
-                        <Typography variant="body2" color="text.secondary">
-                          {h.shares?.toLocaleString()} 股
-                          {h.avgCost ? `｜成本均價 ${h.avgCost}` : ''}
-                          {h.currentPrice ? `｜市價 ${h.currentPrice}` : ''}
-                        </Typography>
-                        {currentValue > 0 && (
-                          <Stack direction="row" spacing={1.5} alignItems="center">
-                            <Typography variant="body2">
-                              現值 NT${fmt(currentValue)}
-                            </Typography>
-                            {pnlPct != null && (
-                              <Chip
-                                size="small"
-                                icon={positive ? <TrendingUpIcon /> : <TrendingDownIcon />}
-                                label={`${positive ? '+' : ''}${pnlPct.toFixed(1)}%`}
-                                color={positive ? 'success' : 'error'}
-                                variant="outlined"
-                              />
-                            )}
-                          </Stack>
+                        {currentPx > 0 ? (
+                          <Typography variant="body2" color="text.secondary">
+                            {h.market === 'TW'
+                              ? `市價 NT$${currentPx}${priceUpdated ? ` (${priceUpdated})` : ''}`
+                              : `市價 USD ${currentPx}${priceUpdated ? ` (${priceUpdated})` : ''}`
+                            }
+                          </Typography>
+                        ) : (
+                          <Typography variant="caption" color="text.disabled">
+                            {h.market === 'TW'
+                              ? '尚未取得 FinMind 股價，請點「重新整理」'
+                              : '尚未取得 Yahoo Finance 股價，請點「重新整理」'}
+                          </Typography>
                         )}
-                        {annualDiv > 0 && (
+                        {divPerShare > 0 && (
                           <Typography variant="caption" color="success.main">
-                            預期年配息 NT${fmt(annualDiv)}（月均 NT${fmt(annualDiv / 12)}）
+                            年配息/股 NT${divPerShare.toFixed(2)}
+                          </Typography>
+                        )}
+                        {h.market === 'US' && h.annualYieldPct > 0 && (
+                          <Typography variant="caption" color="text.secondary">
+                            年殖利率 {h.annualYieldPct}%
                           </Typography>
                         )}
                       </Stack>
@@ -645,6 +741,28 @@ function HoldingsTab({ userId }) {
         onClose={() => setDeleteTarget(null)}
         onConfirm={handleDelete}
       />
+
+      <Divider sx={{ my: 2 }} />
+      <Box>
+        <Typography variant="subtitle2" color="text.secondary" gutterBottom>資料遷移</Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+          將持股設定中的股數與成交均價遷移至 2026-05 月份資產紀錄（僅需執行一次）。
+        </Typography>
+        {migrateMsg && (
+          <Alert severity={migrateMsg.includes('失敗') ? 'error' : 'success'} sx={{ mb: 1 }}>
+            {migrateMsg}
+          </Alert>
+        )}
+        <Button
+          variant="outlined"
+          size="small"
+          onClick={handleMigrate}
+          disabled={migrating || holdings.length === 0}
+          startIcon={migrating ? <CircularProgress size={14} /> : null}
+        >
+          {migrating ? '遷移中…' : '遷移持股至 2026-05 紀錄'}
+        </Button>
+      </Box>
     </Box>
   )
 }
