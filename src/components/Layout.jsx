@@ -73,7 +73,7 @@ export default function Layout({ children }) {
           </List>
         </Drawer>
       ) : (
-        <AppBar position="fixed" elevation={0} sx={{ bgcolor: 'background.default', borderBottom: 1, borderColor: 'divider' }}>
+        <AppBar position="fixed" elevation={0} sx={{ bgcolor: 'background.default', borderBottom: 1, borderColor: 'divider', color: 'text.primary' }}>
           <Toolbar sx={{ justifyContent: 'space-between' }}>
             <Typography variant="h6" fontWeight={700}>財富地圖</Typography>
             <IconButton onClick={() => navigate('/settings')}>
